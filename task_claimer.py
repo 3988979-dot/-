@@ -145,6 +145,80 @@ def _save_cfg(cfg: dict):
     except Exception:
         pass
 
+
+def _cfg_base_url(cfg: dict) -> str:
+    key = "line2_base" if cfg.get("last_line") == "线路2" else "line1_base"
+    return str(cfg.get(key, "")).rstrip("/")
+
+
+def _cfg_headers(cfg: dict) -> dict:
+    headers: dict = {"Content-Type": "application/json"}
+    if cfg.get("cookie"):
+        headers["Cookie"] = cfg["cookie"]
+    try:
+        extra = json.loads(cfg.get("extra_headers") or "{}")
+        if isinstance(extra, dict):
+            headers.update(extra)
+    except Exception:
+        pass
+    return headers
+
+
+def _get_nested_value(obj, path: str):
+    for key in path.split("."):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            obj = obj.get(key)
+        elif isinstance(obj, list) and key.isdigit():
+            obj = obj[int(key)]
+        else:
+            return None
+    return obj
+
+
+async def _fetch_tasks_with_session(
+    session: aiohttp.ClientSession, cfg: dict, log_fn=None, action_name: str = "查询"
+) -> list:
+    url     = _cfg_base_url(cfg) + str(cfg["list_path"])
+    payload = str(cfg.get("list_payload", "")).strip()
+    timeout = aiohttp.ClientTimeout(connect=0.5, sock_read=1.2)
+
+    try:
+        if payload:
+            async with session.post(url, data=payload, timeout=timeout) as r:
+                data = await r.json(content_type=None)
+        else:
+            async with session.get(url, timeout=timeout) as r:
+                data = await r.json(content_type=None)
+        arr = _get_nested_value(data, str(cfg["tasks_array_path"]))
+        return arr if isinstance(arr, list) else []
+    except asyncio.TimeoutError:
+        if log_fn:
+            if action_name == "查询":
+                log_fn("⚠ 查询超时（已重连，将继续轮询）")
+            else:
+                log_fn(f"⚠ {action_name}超时")
+        return []
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"⚠ {action_name}异常: {exc}")
+        return []
+
+
+async def _fetch_tasks_once(cfg: dict, log_fn=None, action_name: str = "查询") -> list:
+    connector = aiohttp.TCPConnector(
+        limit=8,
+        limit_per_host=8,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+        force_close=True,
+    )
+    async with aiohttp.ClientSession(
+        connector=connector, headers=_cfg_headers(cfg)
+    ) as session:
+        return await _fetch_tasks_with_session(session, cfg, log_fn, action_name)
+
 # ─── 异步引擎 ─────────────────────────────────────────────────────────────────
 
 class Engine:
@@ -166,34 +240,15 @@ class Engine:
     # ── 工具 ──
 
     def _base_url(self) -> str:
-        key = "line2_base" if self._cfg["last_line"] == "线路2" else "line1_base"
-        return self._cfg[key].rstrip("/")
+        return _cfg_base_url(self._cfg)
 
     def _headers(self) -> dict:
-        h: dict = {"Content-Type": "application/json"}
-        if self._cfg.get("cookie"):
-            h["Cookie"] = self._cfg["cookie"]
-        try:
-            extra = json.loads(self._cfg.get("extra_headers") or "{}")
-            if isinstance(extra, dict):
-                h.update(extra)
-        except Exception:
-            pass
-        return h
+        return _cfg_headers(self._cfg)
 
     @staticmethod
     def _get_nested(obj, path: str):
         """按点分路径从嵌套 dict/list 中取值，如 'data.list'"""
-        for key in path.split("."):
-            if obj is None:
-                return None
-            if isinstance(obj, dict):
-                obj = obj.get(key)
-            elif isinstance(obj, list) and key.isdigit():
-                obj = obj[int(key)]
-            else:
-                return None
-        return obj
+        return _get_nested_value(obj, path)
 
     @staticmethod
     def _is_success(data: dict) -> bool:
@@ -216,24 +271,7 @@ class Engine:
     # ── 轮询 ──
 
     async def _list_tasks(self, session: aiohttp.ClientSession) -> list:
-        url     = self._base_url() + self._cfg["list_path"]
-        payload = self._cfg.get("list_payload", "").strip()
-        timeout = aiohttp.ClientTimeout(connect=0.5, sock_read=1.2)
-        try:
-            if payload:
-                async with session.post(url, data=payload, timeout=timeout) as r:
-                    data = await r.json(content_type=None)
-            else:
-                async with session.get(url, timeout=timeout) as r:
-                    data = await r.json(content_type=None)
-            arr = self._get_nested(data, self._cfg["tasks_array_path"])
-            return arr if isinstance(arr, list) else []
-        except asyncio.TimeoutError:
-            self._log("⚠ 查询超时（已重连，将继续轮询）")
-            return []
-        except Exception as exc:
-            self._log(f"⚠ 查询异常: {exc}")
-            return []
+        return await _fetch_tasks_with_session(session, self._cfg, self._log, "查询")
 
     async def _poller(self, session: aiohttp.ClientSession):
         keyword = self._cfg["last_keyword"]
@@ -389,6 +427,7 @@ class App(tk.Tk):
         self._engine: Optional[Engine]                 = None
         self._loop:   Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread]       = None
+        self._refreshing = False
 
         self._build_ui()
         self._load_ui_values()
@@ -416,15 +455,40 @@ class App(tk.Tk):
         self._kw_cb = ttk.Combobox(top, textvariable=self._kw_var, width=30)
         self._kw_cb.pack(side="left", padx=(2, 14))
 
+        self._btn_refresh = ttk.Button(top, text="↻ 刷新任务列表", command=self._refresh_tasks)
+        self._btn_refresh.pack(side="right", padx=(4, 0))
+
         self._btn_stop  = ttk.Button(top, text="■ 停止", command=self._stop,
                                       state="disabled")
-        self._btn_stop.pack(side="right", padx=(4, 0))
+        self._btn_stop.pack(side="right", padx=4)
         self._btn_start = ttk.Button(top, text="▶ 开始", command=self._start)
         self._btn_start.pack(side="right", padx=4)
 
         # ── 标签页 ─────────────────────────────────────────────────────────────
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        # 任务列表页
+        tasks_frame = ttk.Frame(nb, padding=4)
+        nb.add(tasks_frame, text=" 任务列表 ")
+
+        self._tasks_tree = ttk.Treeview(
+            tasks_frame,
+            columns=("name", "qty", "task_id"),
+            show="headings",
+            height=16,
+        )
+        self._tasks_tree.heading("name", text="任务名称")
+        self._tasks_tree.heading("qty", text="余量")
+        self._tasks_tree.heading("task_id", text="任务ID")
+        self._tasks_tree.column("name", width=420, anchor="w")
+        self._tasks_tree.column("qty", width=80, anchor="center")
+        self._tasks_tree.column("task_id", width=180, anchor="w")
+
+        task_vsb = ttk.Scrollbar(tasks_frame, orient="vertical", command=self._tasks_tree.yview)
+        self._tasks_tree.configure(yscrollcommand=task_vsb.set)
+        self._tasks_tree.pack(side="left", fill="both", expand=True)
+        task_vsb.pack(side="right", fill="y")
 
         # 日志页
         log_frame = ttk.Frame(nb, padding=4)
@@ -535,6 +599,58 @@ class App(tk.Tk):
         kws = kws[:40]
         self.cfg["keywords"] = kws
         self._kw_cb["values"] = kws
+
+    def _refresh_tasks(self):
+        if self._refreshing:
+            return
+        self._collect_ui_to_cfg()
+        _save_cfg(self.cfg)
+
+        base = self.cfg["line2_base"] if self.cfg["last_line"] == "线路2" \
+               else self.cfg["line1_base"]
+        if not base:
+            messagebox.showwarning(
+                "配置不完整",
+                f'请先在"设置"页填写 {self.cfg["last_line"]} 的 Base URL'
+            )
+            return
+
+        self._refreshing = True
+        self._btn_refresh.config(state="disabled")
+        self._status_var.set("正在刷新任务列表…")
+        threading.Thread(target=self._run_refresh_tasks, daemon=True).start()
+
+    def _run_refresh_tasks(self):
+        try:
+            snapshot = dict(self.cfg)
+            tasks = asyncio.run(_fetch_tasks_once(snapshot, self._log, "刷新"))
+            name_f = snapshot["claim_name_field"]
+            qty_f = snapshot["claim_qty_field"]
+            id_f = snapshot["claim_id_field"]
+            rows = [
+                (
+                    str(task.get(name_f, "")),
+                    str(task.get(qty_f, "?")),
+                    str(task.get(id_f, "")),
+                )
+                for task in tasks
+            ]
+            rows.sort(key=lambda item: item[0])
+            self.after(0, self._finish_refresh_tasks, rows)
+        except Exception as exc:
+            self._log(f"⚠ 刷新异常: {exc}")
+            self.after(0, self._finish_refresh_tasks, [])
+
+    def _finish_refresh_tasks(self, rows):
+        for item in self._tasks_tree.get_children():
+            self._tasks_tree.delete(item)
+        for row in rows:
+            self._tasks_tree.insert("", "end", values=row)
+
+        self._refreshing = False
+        self._btn_refresh.config(state="normal")
+        self._status_var.set(f"任务列表已刷新，共 {len(rows)} 条")
+        self._log(f"📋 已刷新任务列表，共 {len(rows)} 条")
 
     # ── 启动 / 停止 ──
 
