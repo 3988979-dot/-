@@ -17,7 +17,7 @@ import datetime
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 # ─── 依赖检查 ─────────────────────────────────────────────────────────────────
 
@@ -114,6 +114,8 @@ _DEFAULTS: dict = {
     # 性能参数
     "concurrency":            6,
     "poll_interval":          0.3,   # 轮询间隔（秒）
+    "list_connect_timeout":   0.6,   # 列表连接超时（秒）
+    "list_read_timeout":      1.8,   # 列表读取超时（秒）
     "claim_connect_timeout":  0.3,   # 认领连接超时（秒）
     "claim_read_timeout":     0.8,   # 认领读取超时（秒）
     "burst_window_ms":        800,   # 发现目标后持续抢占的窗口（毫秒）
@@ -182,15 +184,18 @@ async def _fetch_tasks_with_session(
 ) -> list:
     url     = _cfg_base_url(cfg) + str(cfg["list_path"])
     payload = str(cfg.get("list_payload", "")).strip()
-    timeout = aiohttp.ClientTimeout(connect=0.5, sock_read=1.2)
+    timeout = aiohttp.ClientTimeout(
+        connect=float(cfg.get("list_connect_timeout", 0.6)),
+        sock_read=float(cfg.get("list_read_timeout", 1.8)),
+    )
 
     try:
         if payload:
             async with session.post(url, data=payload, timeout=timeout) as r:
-                data = await r.json(content_type=None)
+                data, _ = await _read_json_or_text(r)
         else:
             async with session.get(url, timeout=timeout) as r:
-                data = await r.json(content_type=None)
+                data, _ = await _read_json_or_text(r)
         arr = _get_nested_value(data, str(cfg["tasks_array_path"]))
         return arr if isinstance(arr, list) else []
     except asyncio.TimeoutError:
@@ -212,12 +217,29 @@ async def _fetch_tasks_once(cfg: dict, log_fn=None, action_name: str = "查询")
         limit_per_host=8,
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
-        force_close=True,
     )
     async with aiohttp.ClientSession(
         connector=connector, headers=_cfg_headers(cfg)
     ) as session:
         return await _fetch_tasks_with_session(session, cfg, log_fn, action_name)
+
+
+async def _read_json_or_text(resp: aiohttp.ClientResponse) -> Tuple[dict, str]:
+    try:
+        data = await resp.json(content_type=None)
+        if isinstance(data, dict):
+            return data, ""
+        return {}, json.dumps(data, ensure_ascii=False)
+    except Exception:
+        try:
+            text = await resp.text()
+        except Exception:
+            text = ""
+        try:
+            parsed = json.loads(text) if text else {}
+            return parsed if isinstance(parsed, dict) else {}, text
+        except Exception:
+            return {}, text
 
 # ─── 异步引擎 ─────────────────────────────────────────────────────────────────
 
@@ -251,8 +273,15 @@ class Engine:
         return _get_nested_value(obj, path)
 
     @staticmethod
-    def _is_success(data: dict) -> bool:
+    def _is_success(data: dict, raw_text: str = "", http_status: Optional[int] = None) -> bool:
         """从响应 JSON 判断认领是否成功（兼容多种 code 字段约定）"""
+        for field in ("success", "ok", "isSuccess"):
+            val = data.get(field)
+            if val is True:
+                return True
+            if isinstance(val, str) and val.lower() in ("true", "yes", "ok", "success"):
+                return True
+
         for field in ("code", "status", "errno", "errCode", "err_code"):
             val = data.get(field)
             if val is None:
@@ -266,6 +295,18 @@ class Engine:
             val = str(data.get(field, "")).lower()
             if val in ("ok", "success", "成功"):
                 return True
+
+        for container_field in ("data", "result"):
+            child = data.get(container_field)
+            if isinstance(child, dict) and Engine._is_success(child):
+                return True
+
+        raw = raw_text.lower()
+        if any(word in raw for word in ("success", "ok", "成功", "领取成功", "认领成功")):
+            return True
+
+        if http_status in (200, 201, 204) and not data and not raw.strip():
+            return True
         return False
 
     # ── 轮询 ──
@@ -319,8 +360,8 @@ class Engine:
         )
         try:
             async with session.post(url, data=body, timeout=timeout) as r:
-                data = await r.json(content_type=None)
-                return self._is_success(data)
+                data, raw_text = await _read_json_or_text(r)
+                return self._is_success(data, raw_text, r.status)
         except asyncio.TimeoutError:
             return False
         except Exception:
@@ -374,7 +415,6 @@ class Engine:
             limit_per_host=32,
             ttl_dns_cache=300,
             enable_cleanup_closed=True,
-            force_close=True,   # 每次请求完关闭连接，避免半开连接复用导致超时
         )
         async with aiohttp.ClientSession(
             connector=connector, headers=self._headers()
@@ -411,13 +451,21 @@ _SETTINGS_ROWS = [
     ("认领请求体模板 ({id} 为任务ID)",   "claim_body_template"),
     ("并发数",                           "concurrency"),
     ("轮询间隔 (秒)",                    "poll_interval"),
+    ("查询连接超时 (秒)",                "list_connect_timeout"),
+    ("查询读取超时 (秒)",                "list_read_timeout"),
     ("认领连接超时 (秒)",                "claim_connect_timeout"),
     ("认领读取超时 (秒)",                "claim_read_timeout"),
     ("抢占窗口 (毫秒)",                  "burst_window_ms"),
 ]
 
 _INT_FIELDS   = {"concurrency", "burst_window_ms"}
-_FLOAT_FIELDS = {"poll_interval", "claim_connect_timeout", "claim_read_timeout"}
+_FLOAT_FIELDS = {
+    "poll_interval",
+    "list_connect_timeout",
+    "list_read_timeout",
+    "claim_connect_timeout",
+    "claim_read_timeout",
+}
 
 
 class App(tk.Tk):
